@@ -275,6 +275,13 @@ func (header *Header) SetTLVs(tlvs []TLV) error {
 // the remaining header, assume the reader buffer to be in a corrupt state.
 // Also, this operation will block until enough bytes are available for peeking.
 func Read(reader *bufio.Reader) (*Header, error) {
+	return read(reader, false)
+}
+
+// read is Read with the optional v2 CRC32C integrity policy. When
+// verifyCRC32C is true, a v2 header's CRC32C TLV is validated before the
+// header is accepted; false preserves Read's behavior exactly.
+func read(reader *bufio.Reader, verifyCRC32C bool) (*Header, error) {
 	// In order to improve speed for small non-PROXYed packets, take a peek at the first byte alone.
 	b1, err := reader.Peek(1)
 	if err != nil {
@@ -304,7 +311,7 @@ func Read(reader *bufio.Reader) (*Header, error) {
 			return nil, err
 		}
 		if bytes.Equal(signature[:12], SIGV2) {
-			return parseVersion2(reader)
+			return parseVersion2(reader, verifyCRC32C)
 		}
 	}
 
@@ -363,6 +370,12 @@ func ReadTimeout(reader *bufio.Reader, timeout time.Duration) (*Header, error) {
 // deadline before returning; re-apply your own read deadline afterwards if you
 // had one set.
 func ReadHeaderTimeout(conn net.Conn, reader *bufio.Reader, timeout time.Duration) (*Header, error) {
+	return readHeaderTimeout(conn, reader, timeout, false)
+}
+
+// readHeaderTimeout is ReadHeaderTimeout with the optional v2 CRC32C
+// integrity policy.
+func readHeaderTimeout(conn net.Conn, reader *bufio.Reader, timeout time.Duration, verifyCRC32C bool) (*Header, error) {
 	if timeout > 0 {
 		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 			return nil, err
@@ -374,7 +387,7 @@ func ReadHeaderTimeout(conn net.Conn, reader *bufio.Reader, timeout time.Duratio
 		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	}
 
-	header, err := Read(reader)
+	header, err := read(reader, verifyCRC32C)
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return nil, ErrNoProxyProtocol
 	}

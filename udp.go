@@ -21,13 +21,20 @@ import (
 // configured for the PROXY protocol such datagrams must be dropped, not
 // treated as raw payload.
 func ParseUDPDatagram(datagram []byte) (*Header, []byte, error) {
+	return parseUDPDatagram(datagram, false)
+}
+
+// parseUDPDatagram is ParseUDPDatagram with the optional v2 CRC32C integrity
+// policy. The datagram slice is never modified and the payload stays an
+// independent alias of its suffix.
+func parseUDPDatagram(datagram []byte, verifyCRC32C bool) (*Header, []byte, error) {
 	byteReader := bytes.NewReader(datagram)
 	// Size the buffer to the whole datagram so the header is fully buffered up
 	// front: v1 parsing aborts if the header is not available in a single read,
 	// and a datagram, unlike a stream, can never deliver more bytes later.
 	// bufio enforces a minimum buffer size internally, covering len == 0.
 	reader := bufio.NewReaderSize(byteReader, len(datagram))
-	header, err := Read(reader)
+	header, err := read(reader, verifyCRC32C)
 	if err != nil {
 		return nil, nil, err
 	}

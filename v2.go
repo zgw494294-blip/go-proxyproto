@@ -78,10 +78,20 @@ type _addrUnix struct {
 	Dst [108]byte
 }
 
-func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
+func parseVersion2(reader *bufio.Reader, crc32cEnabled bool) (header *Header, err error) {
+	// src is what the parser consumes from. With the CRC32C policy enabled it
+	// records the exact, complete header bytes (and nothing beyond them) so the
+	// checksum can be verified against what was actually received.
+	var src v2Reader = reader
+	var crcTee *crc32cTeeReader
+	if crc32cEnabled {
+		crcTee = &crc32cTeeReader{r: reader}
+		src = crcTee
+	}
+
 	// Skip first 12 bytes (signature)
 	for range 12 {
-		if _, err = reader.ReadByte(); err != nil {
+		if _, err = src.ReadByte(); err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrCantReadProtocolVersionAndCommand, err)
 		}
 	}
@@ -90,7 +100,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	header.Version = 2
 
 	// Read the 13th byte, protocol version and command
-	b13, err := reader.ReadByte()
+	b13, err := src.ReadByte()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCantReadProtocolVersionAndCommand, err)
 	}
@@ -100,7 +110,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	}
 
 	// Read the 14th byte, address family and protocol
-	b14, err := reader.ReadByte()
+	b14, err := src.ReadByte()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCantReadAddressFamilyAndProtocol, err)
 	}
@@ -129,7 +139,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 
 	// Make sure there are bytes available as specified in length
 	var length uint16
-	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+	if err := binary.Read(src, binary.BigEndian, &length); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCantReadLength, err)
 	}
 
@@ -146,11 +156,15 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 		// the family layout is instead decoded exactly like a PROXY frame
 		// below, preserving the (informational) addresses and any trailing
 		// TLVs, so the header round-trips byte for byte.
+		//
+		// The discarded block is opaque: it is not interpreted as TLVs, so no
+		// CRC32C verification runs here even with the integrity policy
+		// enabled, and the real connection endpoints keep applying.
 		if header.Command == LOCAL {
 			if length > MaxV2HeaderSize {
 				return nil, ErrInvalidLength
 			}
-			if _, err := reader.Discard(int(length)); err != nil {
+			if _, err := src.Discard(int(length)); err != nil {
 				return nil, fmt.Errorf("%w: %w", ErrInvalidLength, err)
 			}
 			header.TransportProtocol = UNSPEC
@@ -170,7 +184,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	}
 
 	// Length-limited reader for payload section
-	payloadReader := io.LimitReader(reader, int64(length)).(*io.LimitedReader)
+	payloadReader := io.LimitReader(src, int64(length)).(*io.LimitedReader)
 
 	// Read addresses and ports for protocols other than UNSPEC.
 	// Ignore address information for UNSPEC, and skip straight to read TLVs,
@@ -220,6 +234,16 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 
 	if payloadReader.N != 0 {
 		return nil, ErrInvalidLength
+	}
+
+	// Validate the optional CRC32C TLV over the exact, complete header bytes
+	// consumed from the wire before accepting the header. A missing CRC TLV
+	// leaves the header accepted. The LOCAL opaque-skip and zero-length paths
+	// returned earlier never reach here.
+	if crcTee != nil {
+		if err := verifyCRC32C(crcTee.raw, header.rawTLVs); err != nil {
+			return nil, err
+		}
 	}
 
 	return header, nil

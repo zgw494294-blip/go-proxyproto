@@ -74,6 +74,14 @@ type Listener struct {
 	ConnPolicy ConnPolicyFunc
 	// ValidateHeader is the validator function for the proxy header.
 	ValidateHeader Validator
+	// ValidateCRC32C enables the optional PROXY protocol v2 CRC32C integrity
+	// policy (spec section 2.2.3) for every accepted connection: a v2 header
+	// carrying a PP2_TYPE_CRC32C TLV is verified before it is accepted, while a
+	// header without one is processed normally. It is off by default; see
+	// NewCRC32CPolicy for the full semantics. Header processing stays lazy, so
+	// a verification error surfaces on the connection's first
+	// Read/Write/address access.
+	ValidateCRC32C bool
 	// ReadHeaderTimeout is the timeout for reading the proxy header.
 	ReadHeaderTimeout time.Duration
 	// ReadBufferSize is the read buffer size for accepted connections. When > 0,
@@ -98,6 +106,9 @@ type Conn struct {
 	header            *Header
 	ProxyHeaderPolicy Policy
 	Validate          Validator
+	// crc32cVerify enables the optional v2 CRC32C TLV verification; set via
+	// WithCRC32C or Listener.ValidateCRC32C. Off by default.
+	crc32cVerify      bool
 	readHeaderTimeout time.Duration
 }
 
@@ -111,6 +122,29 @@ func ValidateHeader(v Validator) func(*Conn) {
 		if v != nil {
 			c.Validate = v
 		}
+	}
+}
+
+// WithCRC32C enables the optional PROXY protocol v2 CRC32C integrity policy
+// (spec section 2.2.3) when passed as an option to NewConn() and for
+// connections accepted by a Listener configured with ValidateCRC32C.
+//
+// When enabled, a v2 header carrying a PP2_TYPE_CRC32C TLV is verified before
+// it is accepted: the received four-byte checksum is compared against the
+// CRC32C (Castagnoli, RFC 4960) of the whole header computed with the
+// checksum bytes set to zero. The single CRC32C TLV may sit at any complete
+// top-level TLV position. A wrong checksum, a non-four-byte CRC32C value,
+// duplicate CRC32C TLVs and incomplete TLV encodings fail header processing
+// with an ordinary error; a header without a CRC32C TLV is processed
+// normally. Processing stays lazy, so the error is reported on the first
+// Read/Write/address access, exactly like other header errors. Only the
+// header bytes are consumed.
+//
+// It is off by default, leaving v1 headers, v2 headers without the TLV,
+// unknown TLVs, plain connections and UDP datagrams unchanged.
+func WithCRC32C() func(*Conn) {
+	return func(c *Conn) {
+		c.crc32cVerify = true
 	}
 }
 
@@ -191,6 +225,9 @@ func (p *Listener) Accept() (net.Conn, error) {
 		opts := []func(*Conn){
 			WithPolicy(proxyHeaderPolicy),
 			ValidateHeader(p.ValidateHeader),
+		}
+		if p.ValidateCRC32C {
+			opts = append(opts, WithCRC32C())
 		}
 		if p.ReadBufferSize > 0 {
 			opts = append(opts, WithBufferSize(p.ReadBufferSize))
@@ -436,7 +473,7 @@ func (p *Conn) readHeader() error {
 		}
 	}
 
-	header, err := Read(p.bufReader)
+	header, err := read(p.bufReader, p.crc32cVerify)
 
 	// If the connection's readHeaderTimeout is more than 0, undo the change to the
 	// deadline that we made above. Because we retain the readDeadline as part of our
